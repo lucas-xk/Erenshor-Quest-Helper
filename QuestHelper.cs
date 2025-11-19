@@ -1,12 +1,13 @@
 ﻿using BepInEx;
+using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.UI;
-using System.Reflection;
 
 namespace questhelper
 {
-    [BepInPlugin("lucasxk.erenshor.questhelper", "Quest Helper", "2.0.0")]
+    [BepInPlugin("lucasxk.erenshor.questhelper", "Quest Helper", "2.1.0")]
     public class QuestHelper : BaseUnityPlugin
     {
         private Texture2D _texYellowExclamation;
@@ -85,11 +86,11 @@ namespace questhelper
                 Texture2D finalTexture = null;
                 QuestMarker.Type finalType = QuestMarker.Type.None;
 
-                // 1 - verify turn in quests
+                // 1 - check turn in quests
                 var questManager = character.GetComponent<QuestManager>();
                 bool foundBlueTurnIn = false;
 
-                // fix 1 - verify if questManager.NPCQuests != null
+                // fix 1 - check if questManager.NPCQuests != null
                 if (questManager != null && questManager.NPCQuests != null)
                 {
                     foreach (Quest quest in questManager.NPCQuests)
@@ -138,7 +139,7 @@ namespace questhelper
                     goto ApplyMarker;
                 }
 
-                // 2 - verify disponibility (if there is no turn in)
+                // 2 - check disponibility (if there is no turn in)
                 if (finalType != QuestMarker.Type.TurnIn)
                 {
                     var availType = GetQuestAvailabilityType(character);
@@ -213,57 +214,86 @@ namespace questhelper
         private QuestMarker.Type GetQuestAvailabilityType(Character character)
         {
             var npcDialogueManager = character.GetComponent<NPCDialogManager>();
+            var questManager = character.GetComponent<QuestManager>();
 
-            // fix 3 - verify null in MyDialogOptions
-            if (npcDialogueManager == null || npcDialogueManager.MyDialogOptions == null) return QuestMarker.Type.None;
-
-            bool foundBlueExclamation = false;
-            bool foundBlueQuestion = false;
-
-            // fix 4 - verify if SpecificClass !=null before .Count
-            bool classCheck = npcDialogueManager.SpecificClass == null ||
-                              npcDialogueManager.SpecificClass.Count == 0 ||
-                              npcDialogueManager.SpecificClass.Contains(GameData.PlayerStats.CharacterClass);
-
-            if (classCheck)
+            // class filter
+            if (npcDialogueManager != null)
             {
-                foreach (var npcDialogue in npcDialogueManager.MyDialogOptions)
+                bool hasClassRestriction = npcDialogueManager.SpecificClass != null &&
+                                           npcDialogueManager.SpecificClass.Count > 0;
+
+                if (hasClassRestriction)
                 {
-                    // fix 5 - verify if npcDialogue == null
-                    if (npcDialogue == null) continue;
-
-                    var quest = npcDialogue.QuestToAssign;
-                    if (quest == null) continue;
-
-                    if (GameData.HasQuest.Contains(quest.DBName)) continue;
-
-                    // if the quest was never done
-                    if (!GameData.IsQuestDone(quest.DBName))
+                    // if the player class is not on the allowed list, return.
+                    if (!npcDialogueManager.SpecificClass.Contains(GameData.PlayerStats.CharacterClass))
                     {
-                        if (!quest.repeatable)
-                        {
-                            // yellow. Max priority. Return.
-                            return QuestMarker.Type.Available;
-                        }
-                        else
-                        {
-                            // blue. Flag and continues.
-                            foundBlueExclamation = true;
-                        }
-                    }
-                    // if was done and it's repeatable
-                    else if (quest.repeatable)
-                    {
-                        foundBlueQuestion = true;
+                        return QuestMarker.Type.None;
                     }
                 }
             }
 
-            // there is no new yellow
+            bool foundBlueExclamation = false;
+            bool foundBlueQuestion = false;
 
-            if (foundBlueExclamation) return QuestMarker.Type.RepeatableNew; // blue !
-            if (foundBlueQuestion) return QuestMarker.Type.RepeatableDone;   // blue ?
+            // if the quest is duplicated (npcDialogueManager and QuestManager) dialogues stays
+            HashSet<string> processedQuests = new HashSet<string>();
 
+            // 1 - check dialogues (priority)
+            if (npcDialogueManager != null && npcDialogueManager.MyDialogOptions != null)
+            {
+                foreach (var npcDialogue in npcDialogueManager.MyDialogOptions)
+                {
+                    if (npcDialogue == null) continue;
+                    var quest = npcDialogue.QuestToAssign;
+                    if (quest == null) continue;
+
+                    processedQuests.Add(quest.DBName); // mark as processed
+
+                    var status = CheckQuestStatus(quest);
+                    if (status == QuestMarker.Type.Available) return QuestMarker.Type.Available; // yellow prevails
+                    if (status == QuestMarker.Type.RepeatableNew) foundBlueExclamation = true;
+                    if (status == QuestMarker.Type.RepeatableDone) foundBlueQuestion = true;
+                }
+            }
+
+            // 2 - check loose quests (QuestManager)
+            if (questManager != null && questManager.NPCQuests != null)
+            {
+                foreach (var quest in questManager.NPCQuests)
+                {
+                    if (quest == null) continue;
+
+                    // ignore the quest if already passed by the dialogue, do not process twice
+                    if (processedQuests.Contains(quest.DBName)) continue;
+
+                    var status = CheckQuestStatus(quest);
+
+                    if (status == QuestMarker.Type.Available) return QuestMarker.Type.Available; // yellow prevails
+                    if (status == QuestMarker.Type.RepeatableNew) foundBlueExclamation = true;
+                    if (status == QuestMarker.Type.RepeatableDone) foundBlueQuestion = true;
+                }
+            }
+
+            // return the best result found
+            if (foundBlueExclamation) return QuestMarker.Type.RepeatableNew;
+            if (foundBlueQuestion) return QuestMarker.Type.RepeatableDone;
+
+            return QuestMarker.Type.None;
+        }
+
+        private QuestMarker.Type CheckQuestStatus(Quest quest)
+        {
+            if (GameData.HasQuest.Contains(quest.DBName)) return QuestMarker.Type.None;
+
+            if (!GameData.IsQuestDone(quest.DBName))
+            {
+                if (!quest.repeatable) return QuestMarker.Type.Available; // yellow
+                else return QuestMarker.Type.RepeatableNew; // blue !
+            }
+            else if (quest.repeatable)
+            {
+                return QuestMarker.Type.RepeatableDone; // blue ?
+            }
             return QuestMarker.Type.None;
         }
 
